@@ -21,5 +21,7 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 </dict>
 </plist>
 PLIST
-codesign --force -s - "$APP" >/dev/null 2>&1 || true
+# Finder xattrs make codesign refuse the bundle, so strip them first
+xattr -cr "$APP"
+codesign --force -s - "$APP"
 echo "built $APP"
