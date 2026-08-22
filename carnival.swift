@@ -52,19 +52,26 @@ func memStat() -> MemStat {
     return MemStat(used: used, pressure: pressure, swap: Double(xsw.xsu_used))
 }
 
-func gpuUsage() -> Double {
+// The accelerator entries never change during a session, so look them up once:
+// IOServiceGetMatchingServices was 90% of the per-tick cost.
+let gpuServices: [io_service_t] = {
     var it: io_iterator_t = 0
     guard IOServiceGetMatchingServices(kIOMainPortDefault, IOServiceMatching("IOAccelerator"), &it) == KERN_SUCCESS
-    else { return 0 }
+    else { return [] }
     defer { IOObjectRelease(it) }
+    var out: [io_service_t] = []
+    while case let e = IOIteratorNext(it), e != 0 { out.append(e) }
+    return out
+}()
+
+func gpuUsage() -> Double {
     var best = 0.0
-    while case let e = IOIteratorNext(it), e != 0 {
+    for e in gpuServices {
         if let raw = IORegistryEntryCreateCFProperty(e, "PerformanceStatistics" as CFString, kCFAllocatorDefault, 0),
            let perf = raw.takeRetainedValue() as? [String: Any],
            let util = perf["Device Utilization %"] as? Int {
             best = max(best, Double(util) / 100)
         }
-        IOObjectRelease(e)
     }
     return best
 }
@@ -251,6 +258,7 @@ final class Carnival: NSObject, NSApplicationDelegate, NSMenuDelegate {
     let login = NSMenuItem(title: "Launch at Login", action: #selector(toggleLogin), keyEquivalent: "")
     lazy var sensors = Sensors()
     var open = false
+    var ticks = 0
 
     static func main() {
         if CommandLine.arguments.contains("--sensors") {
@@ -298,6 +306,7 @@ final class Carnival: NSObject, NSApplicationDelegate, NSMenuDelegate {
         item.menu = menu       // NSMenu handles open/close/highlight natively - no activation dance
 
         let t = Timer(timeInterval: 2, repeats: true) { [weak self] _ in self?.tick() }
+        t.tolerance = 0.5                       // lets the kernel coalesce this with other wakeups
         RunLoop.main.add(t, forMode: .common)   // .common keeps it ticking while the menu is tracking
         tick()
     }
@@ -323,8 +332,11 @@ final class Carnival: NSObject, NSApplicationDelegate, NSMenuDelegate {
         panel.prs = m.pressure; panel.swap = m.swap
         panel.cpu.push(c); panel.gpu.push(g); panel.mem.push(panel.memV)
         guard open else { return }              // temps + redraw only while the menu is up
-        let t = sensors?.temps() ?? (.nan, .nan)
-        panel.cpuT = t.0; panel.gpuT = t.1
+        ticks += 1
+        if ticks % 2 == 1 {                     // a ~2 ms read; temperature drifts slower than 4 s
+            let t = sensors?.temps() ?? (.nan, .nan)
+            panel.cpuT = t.0; panel.gpuT = t.1
+        }
         panel.needsDisplay = true
     }
 }

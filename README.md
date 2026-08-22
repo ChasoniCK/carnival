@@ -25,7 +25,7 @@ open carnival.app
 `./tools/make-icon.sh` regenerates `carnival.icns`; the artwork is drawn in code,
 there is no binary source asset to edit.
 
-Requires the Xcode command line tools and macOS 14 or newer. The build ad-hoc
+Requires the Xcode command line tools and macOS 26 or newer. The build ad-hoc
 signs the bundle, so a copy downloaded from Releases needs its quarantine flag
 cleared once:
 

@@ -50,7 +50,7 @@ func draw() -> NSImage {
     // gondolas, hung outside the rim
     let cabin: CGFloat = 8
     for i in 0..<Int(cabin) {
-        let a = CGFloat(i) / cabin * .pi * 2 + .pi / 8
+        let a = CGFloat(i) / cabin * .pi * 2 - .pi / 2   // seat 0 sits at the bottom
         let p = NSPoint(x: cx + cos(a) * (R + 42), y: cy + sin(a) * (R + 42))
         green.withAlphaComponent(0.92).setFill()
         NSBezierPath(roundedRect: NSRect(x: p.x - 36, y: p.y - 29, width: 72, height: 58),
@@ -63,7 +63,7 @@ func draw() -> NSImage {
     spokes.lineWidth = 16
     spokes.lineCapStyle = .round
     for i in 0..<Int(cabin) {
-        let a = CGFloat(i) / cabin * .pi * 2 + .pi / 8
+        let a = CGFloat(i) / cabin * .pi * 2 - .pi / 2   // seat 0 sits at the bottom
         spokes.move(to: NSPoint(x: cx, y: cy))
         spokes.line(to: NSPoint(x: cx + cos(a) * R, y: cy + sin(a) * R))
     }

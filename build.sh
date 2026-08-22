@@ -8,7 +8,7 @@ work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 mkdir -p "$work/$APP/Contents/MacOS" "$work/$APP/Contents/Resources"
 cp carnival.icns "$work/$APP/Contents/Resources/carnival.icns"
-swiftc -O -wmo -parse-as-library -target arm64-apple-macos14.0 carnival.swift \
+swiftc -O -wmo -parse-as-library -target arm64-apple-macos26.0 carnival.swift \
     -o "$work/$APP/Contents/MacOS/carnival" -framework AppKit -framework IOKit
 cat > "$work/$APP/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
@@ -19,10 +19,10 @@ cat > "$work/$APP/Contents/Info.plist" <<'PLIST'
 	<key>CFBundleIconFile</key><string>carnival</string>
 	<key>CFBundleIdentifier</key><string>local.carnival</string>
 	<key>CFBundleName</key><string>carnival</string>
-	<key>CFBundleShortVersionString</key><string>1.1</string>
+	<key>CFBundleShortVersionString</key><string>1.2</string>
 	<key>CFBundlePackageType</key><string>APPL</string>
 	<key>LSUIElement</key><true/>
-	<key>LSMinimumSystemVersion</key><string>14.0</string>
+	<key>LSMinimumSystemVersion</key><string>26.0</string>
 	<key>NSHighResolutionCapable</key><true/>
 </dict>
 </plist>
