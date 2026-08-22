@@ -260,6 +260,19 @@ final class Carnival: NSObject, NSApplicationDelegate, NSMenuDelegate {
             print(String(format: "--\ncpu %.1f  gpu %.1f", t.0, t.1))
             return
         }
+        // --login on|off|status: the Launch at Login registration records the bundle's
+        // path, so a moved app has to re-register from its new location
+        if let i = CommandLine.arguments.firstIndex(of: "--login") {
+            let arg = i + 1 < CommandLine.arguments.count ? CommandLine.arguments[i + 1] : "status"
+            do {
+                if arg == "on" { try SMAppService.mainApp.register() }
+                if arg == "off" { try SMAppService.mainApp.unregister() }
+            } catch { print("failed: \(error)") }
+            let s = SMAppService.mainApp.status
+            let names = [0: "notRegistered", 1: "enabled", 2: "requiresApproval", 3: "notFound"]
+            print("\(names[s.rawValue] ?? "\(s.rawValue)")  \(Bundle.main.bundlePath)")
+            return
+        }
         let app = NSApplication.shared
         let d = Carnival()
         shared = d
