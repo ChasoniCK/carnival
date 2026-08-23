@@ -1,4 +1,5 @@
 import AppKit
+import CoreText
 import IOKit
 import ServiceManagement
 
@@ -92,7 +93,8 @@ final class Sensors {
     private let field: Int32 = 15 << 16   // kIOHIDEventTypeTemperature
 
     private var named: (cpu: [AnyObject], gpu: [AnyObject]) = ([], [])   // Intel / M1-M2 naming
-    private var dies: [AnyObject] = []                                    // M3+ "PMU tdieN"
+    private var dieNames: [String] = []                                   // M3+ "PMU tdieN"
+    private var dieGroups: [[AnyObject]] = []   // each physical die is exposed 3x
     private(set) var all: [(String, AnyObject)] = []
 
     init?() {
@@ -123,7 +125,10 @@ final class Sensors {
             all.append((n, svc))
             if n.contains("GPU") { named.gpu.append(svc) }
             else if n.hasPrefix("pACC MTR") || n.hasPrefix("eACC MTR") || n.contains("CPU") { named.cpu.append(svc) }
-            else if n.hasPrefix("PMU tdie") { dies.append(svc) }
+            else if n.hasPrefix("PMU tdie") {
+                if let i = dieNames.firstIndex(of: n) { dieGroups[i].append(svc) }
+                else { dieNames.append(n); dieGroups.append([svc]) }
+            }
         }
     }
 
@@ -131,11 +136,39 @@ final class Sensors {
     /// M3+ chips expose 14 unlabeled die sensors instead of per-block ones. On a single
     /// die the hot spot is the CPU cluster and the GPU side tracks the die average, so
     /// that is what carnival reports. `carnival --sensors` dumps the raw list.
+    /// Each read is a ~845 us blocking round trip to the PMU and cost is strictly linear
+    /// in read count, so this reads one client per die (14) and only re-reads the three
+    /// hottest dies in full (20 total instead of 42). Ranking comes from the current pass,
+    /// never a cached one: a stale ranking mis-reports the hot spot by up to 1.4 C and is
+    /// wrong on the first read after launch.
     func temps() -> (Double, Double) {
         if !named.cpu.isEmpty || !named.gpu.isEmpty { return (mean(named.cpu), mean(named.gpu)) }
-        let v = values(dies)
-        guard !v.isEmpty else { return (.nan, .nan) }
-        return (v.max()!, v.reduce(0, +) / Double(v.count))
+        let n = dieGroups.count
+        guard n > 0 else { return (.nan, .nan) }
+        var peak = [Double](repeating: -1, count: n)
+        var avg = [Double](repeating: -1, count: n)
+        var ok = [Bool](repeating: false, count: n)
+        for j in 0..<n {
+            let v = read(dieGroups[j][0])
+            if v > 0 && v < 150 { peak[j] = v; avg[j] = v; ok[j] = true }
+        }
+        for j in (0..<n).filter({ ok[$0] }).sorted(by: { peak[$0] > peak[$1] }).prefix(3) {
+            var best = peak[j], acc = peak[j], c = 1.0
+            for svc in dieGroups[j].dropFirst() {
+                let v = read(svc)
+                if v > 0 && v < 150 { best = max(best, v); acc += v; c += 1 }
+            }
+            peak[j] = best; avg[j] = acc / c
+        }
+        let live = (0..<n).filter { ok[$0] }
+        guard !live.isEmpty else { return (.nan, .nan) }
+        return (live.map { peak[$0] }.max()!,
+                live.reduce(0.0) { $0 + avg[$1] } / Double(live.count))
+    }
+
+    private func read(_ svc: AnyObject) -> Double {
+        guard let ev = copyEvt(svc, 15, 0, 0)?.takeRetainedValue() else { return -1 }
+        return getFloat(ev, field)
     }
 
     func values(_ group: [AnyObject]) -> [Double] {
@@ -190,12 +223,40 @@ final class Panel: NSView {
         .font: NSFont.monospacedDigitSystemFont(ofSize: 20, weight: .medium),
         .foregroundColor: NSColor.labelColor]
 
-    private func text(_ s: String, _ x: CGFloat, _ y: CGFloat, _ a: [NSAttributedString.Key: Any]) {
-        (s as NSString).draw(at: NSPoint(x: x, y: y), withAttributes: a)
+    private static let styles: [[NSAttributedString.Key: Any]] = [head, meta, temp, value]
+    // NSString.draw(at:) puts the line top at y; CTLineDraw wants the baseline.
+    private static let baselines: [CGFloat] = styles.map { ($0[.font] as! NSFont).ascender.rounded() - 0.25 }
+
+    private struct LineKey: Hashable { let s: String; let style: Int; let appearance: String }
+    private var lines: [LineKey: (line: CTLine, width: CGFloat)] = [:]
+
+    // Laying a string out costs ~8 us, drawing a laid-out one ~1 us, and the panel
+    // redraws the same handful of strings for as long as the menu is open.
+    private func laid(_ s: String, _ style: Int) -> (line: CTLine, width: CGFloat) {
+        let key = LineKey(s: s, style: style, appearance: effectiveAppearance.name.rawValue)
+        if let v = lines[key] { return v }
+        if lines.count > 192 { lines.removeAll(keepingCapacity: true) }  // MEM row strings are unbounded
+        let line = CTLineCreateWithAttributedString(
+            NSAttributedString(string: s, attributes: Panel.styles[style]))
+        let v = (line, CGFloat(CTLineGetTypographicBounds(line, nil, nil, nil)))
+        lines[key] = v
+        return v
     }
 
-    private func textRight(_ s: String, _ x: CGFloat, _ y: CGFloat, _ a: [NSAttributedString.Key: Any]) {
-        (s as NSString).draw(at: NSPoint(x: x - (s as NSString).size(withAttributes: a).width, y: y), withAttributes: a)
+    private func draw(_ v: (line: CTLine, width: CGFloat), _ x: CGFloat, _ y: CGFloat, _ style: Int) {
+        guard let ctx = NSGraphicsContext.current?.cgContext else { return }
+        ctx.textMatrix = CGAffineTransform(scaleX: 1, y: -1)   // the view is flipped
+        ctx.textPosition = CGPoint(x: x, y: y + Panel.baselines[style])
+        CTLineDraw(v.line, ctx)
+    }
+
+    private func text(_ s: String, _ x: CGFloat, _ y: CGFloat, _ style: Int) {
+        draw(laid(s, style), x, y, style)
+    }
+
+    private func textRight(_ s: String, _ x: CGFloat, _ y: CGFloat, _ style: Int) {
+        let v = laid(s, style)
+        draw(v, x - v.width, y, style)
     }
 
     private func graph(_ h: History, _ r: NSRect, _ c: NSColor) {
@@ -224,10 +285,10 @@ final class Panel: NSView {
 
     private func row(_ name: String, _ v: Double, _ h: History, _ y: CGFloat, _ w: CGFloat,
                      temp: Double = .nan, meta: String? = nil, heat: Double? = nil) -> CGFloat {
-        text(name, 14, y, Panel.head)
-        if !temp.isNaN { textRight(String(format: "%.0f°C", temp), w - 14, y - 3, Panel.temp) }
-        if let meta { textRight(meta, w - 14, y - 3, Panel.meta) }
-        text(String(format: "%.0f%%", v * 100), 13, y + 13, Panel.value)
+        text(name, 14, y, 0)
+        if !temp.isNaN { textRight(String(format: "%.0f°C", temp), w - 14, y - 3, 2) }
+        if let meta { textRight(meta, w - 14, y - 3, 1) }
+        text(String(format: "%.0f%%", v * 100), 13, y + 13, 3)
         graph(h, NSRect(x: 76, y: y + 14, width: w - 90, height: 27), tint(heat ?? v))
         return y + 55
     }
@@ -256,9 +317,23 @@ final class Carnival: NSObject, NSApplicationDelegate, NSMenuDelegate {
     let panel = Panel(frame: NSRect(x: 0, y: 0, width: 290, height: 180))
     let menu = NSMenu()
     let login = NSMenuItem(title: "Launch at Login", action: #selector(toggleLogin), keyEquivalent: "")
-    lazy var sensors = Sensors()
+
+    // Nobody is looking 99.9% of the time, and a wakeup costs ~284 us whatever it does,
+    // so the closed cadence is what the battery actually pays for.
+    static let closedTick = 10.0
+    static let openTick = 2.0
+    static let histStep = 10.0   // sparkline step, held fixed so the two cadences never mix scales
+
+    var timer: Timer?
     var open = false
-    var ticks = 0
+    var lastCPU = 0.0, lastHist = 0.0, lastTemp = 0.0
+    var acc = (cpu: 0.0, gpu: 0.0, mem: 0.0, n: 0.0)
+
+    // A temperature pass blocks its thread for ~17 ms while the PMU answers, but burns
+    // under 1 ms of CPU doing it. Off the main thread that wait costs the UI nothing.
+    let tempQ = DispatchQueue(label: "carnival.temps", qos: .utility)
+    var sensors: Sensors?        // created on tempQ and only ever touched there
+    var tempBusy = false
 
     static func main() {
         if CommandLine.arguments.contains("--sensors") {
@@ -305,15 +380,15 @@ final class Carnival: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.delegate = self
         item.menu = menu       // NSMenu handles open/close/highlight natively - no activation dance
 
-        let t = Timer(timeInterval: 2, repeats: true) { [weak self] _ in self?.tick() }
-        t.tolerance = 0.5                       // lets the kernel coalesce this with other wakeups
-        RunLoop.main.add(t, forMode: .common)   // .common keeps it ticking while the menu is tracking
+        tempQ.async { self.sensors = Sensors() }   // ~77 HID services; warm it before the first menu
+        cadence(Carnival.closedTick)
         tick()
     }
 
     func menuWillOpen(_ m: NSMenu) {
         open = true
         login.state = SMAppService.mainApp.status == .enabled ? .on : .off   // may have changed in System Settings
+        cadence(Carnival.openTick)
         tick()
     }
 
@@ -324,18 +399,60 @@ final class Carnival: NSObject, NSApplicationDelegate, NSMenuDelegate {
         } catch { NSSound.beep() }
         login.state = SMAppService.mainApp.status == .enabled ? .on : .off
     }
-    func menuDidClose(_ m: NSMenu) { open = false }
+    func menuDidClose(_ m: NSMenu) {
+        open = false
+        cadence(Carnival.closedTick)
+    }
+
+    private func cadence(_ interval: TimeInterval) {
+        timer?.invalidate()
+        let t = Timer(timeInterval: interval, repeats: true) { [weak self] _ in self?.tick() }
+        t.tolerance = interval / 4
+        RunLoop.main.add(t, forMode: .common)   // .common keeps it ticking while the menu is tracking
+        timer = t
+    }
 
     func tick() {
-        let c = cpuUsage(), g = gpuUsage(), m = memStat()
-        panel.cpuV = c; panel.gpuV = g; panel.memV = m.used / totalMem
+        let now = ProcessInfo.processInfo.systemUptime
+        // cpuUsage is a delta of tick counters: sampled too close together it is noise,
+        // which is exactly what an immediate tick on menu-open would otherwise produce
+        if now - lastCPU > 0.4 {
+            panel.cpuV = cpuUsage()
+            lastCPU = now
+        }
+        panel.gpuV = gpuUsage()
+        let m = memStat()
+        panel.memV = m.used / totalMem
         panel.prs = m.pressure; panel.swap = m.swap
-        panel.cpu.push(c); panel.gpu.push(g); panel.mem.push(panel.memV)
+
+        // History advances on wall-clock, not on ticks, so opening the menu does not
+        // stretch the right-hand side of the sparkline into a different time scale.
+        acc.cpu += panel.cpuV; acc.gpu += panel.gpuV; acc.mem += panel.memV; acc.n += 1
+        if now - lastHist >= Carnival.histStep - 0.5 {
+            panel.cpu.push(acc.cpu / acc.n)
+            panel.gpu.push(acc.gpu / acc.n)
+            panel.mem.push(acc.mem / acc.n)
+            acc = (0, 0, 0, 0)
+            lastHist = now
+        }
+
         guard open else { return }              // temps + redraw only while the menu is up
-        ticks += 1
-        if ticks % 2 == 1 {                     // a ~2 ms read; temperature drifts slower than 4 s
-            let t = sensors?.temps() ?? (.nan, .nan)
-            panel.cpuT = t.0; panel.gpuT = t.1
+        if !tempBusy && now - lastTemp > 3.5 {
+            tempBusy = true
+            tempQ.async { [weak self] in
+                let t = self?.sensors?.temps() ?? (.nan, .nan)
+                DispatchQueue.main.async {
+                    guard let self else { return }
+                    self.tempBusy = false
+                    self.lastTemp = ProcessInfo.processInfo.systemUptime
+                    // the panel prints whole degrees, so a fractional change is not worth
+                    // a second 4.5 ms redraw on top of the one this tick already queued
+                    func deg(_ x: Double) -> Int { x.isFinite ? Int(x.rounded()) : .min }
+                    let changed = deg(t.0) != deg(self.panel.cpuT) || deg(t.1) != deg(self.panel.gpuT)
+                    self.panel.cpuT = t.0; self.panel.gpuT = t.1
+                    if self.open && changed { self.panel.needsDisplay = true }
+                }
+            }
         }
         panel.needsDisplay = true
     }

@@ -19,7 +19,7 @@ cat > "$work/$APP/Contents/Info.plist" <<'PLIST'
 	<key>CFBundleIconFile</key><string>carnival</string>
 	<key>CFBundleIdentifier</key><string>local.carnival</string>
 	<key>CFBundleName</key><string>carnival</string>
-	<key>CFBundleShortVersionString</key><string>1.2</string>
+	<key>CFBundleShortVersionString</key><string>1.3</string>
 	<key>CFBundlePackageType</key><string>APPL</string>
 	<key>LSUIElement</key><true/>
 	<key>LSMinimumSystemVersion</key><string>26.0</string>
