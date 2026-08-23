@@ -365,6 +365,9 @@ final class Carnival: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func applicationDidFinishLaunching(_ n: Notification) {
+        // Without a stable autosave name the system re-picks a slot on every launch, so
+        // a reinstall drops the icon back into the overflow area behind the chevron.
+        item.autosaveName = "carnival"
         item.button?.image = NSImage(systemSymbolName: "gauge.with.dots.needle.33percent", accessibilityDescription: "carnival")
 
         let mi = NSMenuItem()
