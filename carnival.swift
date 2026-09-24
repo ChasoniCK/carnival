@@ -1,45 +1,49 @@
 import AppKit
 import CoreText
 import IOKit
+import os
 import ServiceManagement
 
 // MARK: - metrics
 
 let pageSize = Double(vm_kernel_page_size)
 let totalMem = Double(ProcessInfo.processInfo.physicalMemory)
+// mach_host_self() is a trap that adds a reference to the host port every time it is
+// called; one right held for the life of the process takes a syscall out of each sample.
+let hostPort = mach_host_self()
+
+/// Seconds awake since boot, read from the commpage: no syscall, no Objective-C.
+func uptime() -> Double { Double(clock_gettime_nsec_np(CLOCK_UPTIME_RAW)) / 1e9 }
 
 func hostCPU() -> host_cpu_load_info {
     var size = mach_msg_type_number_t(MemoryLayout<host_cpu_load_info>.stride / MemoryLayout<integer_t>.stride)
     var info = host_cpu_load_info()
     withUnsafeMutablePointer(to: &info) { p in
         p.withMemoryRebound(to: integer_t.self, capacity: Int(size)) {
-            _ = host_statistics(mach_host_self(), HOST_CPU_LOAD_INFO, $0, &size)
+            _ = host_statistics(hostPort, HOST_CPU_LOAD_INFO, $0, &size)
         }
     }
     return info
 }
 
-var prevTicks = hostCPU()
-
-func cpuUsage() -> Double {
-    let c = hostCPU()
-    let user = Double(c.cpu_ticks.0 &- prevTicks.cpu_ticks.0)
-    let sys  = Double(c.cpu_ticks.1 &- prevTicks.cpu_ticks.1)
-    let idle = Double(c.cpu_ticks.2 &- prevTicks.cpu_ticks.2)
-    let nice = Double(c.cpu_ticks.3 &- prevTicks.cpu_ticks.3)
-    prevTicks = c
+/// Busy share of the CPU ticks that elapsed between two readings of the counters.
+func cpuLoad(_ a: host_cpu_load_info, _ b: host_cpu_load_info) -> Double {
+    let user = Double(b.cpu_ticks.0 &- a.cpu_ticks.0)
+    let sys  = Double(b.cpu_ticks.1 &- a.cpu_ticks.1)
+    let idle = Double(b.cpu_ticks.2 &- a.cpu_ticks.2)
+    let nice = Double(b.cpu_ticks.3 &- a.cpu_ticks.3)
     let total = user + sys + idle + nice
     return total > 0 ? (user + sys + nice) / total : 0
 }
 
-struct MemStat { var used = 0.0; var pressure = 0.0; var swap = 0.0 }
+struct MemStat { var used = 0.0; var pressure = 0.0 }
 
 func memStat() -> MemStat {
     var st = vm_statistics64()
     var count = mach_msg_type_number_t(MemoryLayout<vm_statistics64>.stride / MemoryLayout<integer_t>.stride)
     withUnsafeMutablePointer(to: &st) { p in
         p.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
-            _ = host_statistics64(mach_host_self(), HOST_VM_INFO64, $0, &count)
+            _ = host_statistics64(hostPort, HOST_VM_INFO64, $0, &count)
         }
     }
     // Activity Monitor's "memory used": app + wired + compressed
@@ -47,10 +51,19 @@ func memStat() -> MemStat {
                 + Double(st.wire_count) + Double(st.compressor_page_count)
                 - Double(st.purgeable_count) - Double(st.external_page_count)) * pageSize
     let pressure = (Double(st.wire_count) + Double(st.compressor_page_count)) * pageSize / totalMem
+    return MemStat(used: used, pressure: pressure)
+}
+
+/// Swap in use. Only the open panel prints it, so the closed tick never asks; the MIB is
+/// spelled out because sysctlbyname spends a second syscall looking the name up.
+func swapUsed() -> Double {
+    var mib = (CTL_VM, VM_SWAPUSAGE)
     var xsw = xsw_usage()
-    var sz = MemoryLayout<xsw_usage>.size
-    sysctlbyname("vm.swapusage", &xsw, &sz, nil, 0)
-    return MemStat(used: used, pressure: pressure, swap: Double(xsw.xsu_used))
+    var size = MemoryLayout<xsw_usage>.size
+    let r = withUnsafeMutablePointer(to: &mib) {
+        $0.withMemoryRebound(to: Int32.self, capacity: 2) { sysctl($0, 2, &xsw, &size, nil, 0) }
+    }
+    return r == 0 ? Double(xsw.xsu_used) : 0
 }
 
 // The accelerator entries never change during a session, so look them up once:
@@ -65,13 +78,24 @@ let gpuServices: [io_service_t] = {
     return out
 }()
 
+let perfKey = "PerformanceStatistics" as CFString
+let utilKey = "Device Utilization %" as CFString
+
+// The one value is read straight out of the CFDictionary: bridging the dictionary to
+// [String: Any] converted every entry in it, every tick, to look at one of them.
 func gpuUsage() -> Double {
     var best = 0.0
     for e in gpuServices {
-        if let raw = IORegistryEntryCreateCFProperty(e, "PerformanceStatistics" as CFString, kCFAllocatorDefault, 0),
-           let perf = raw.takeRetainedValue() as? [String: Any],
-           let util = perf["Device Utilization %"] as? Int {
-            best = max(best, Double(util) / 100)
+        guard let perf = IORegistryEntryCreateCFProperty(e, perfKey, kCFAllocatorDefault, 0)?.takeRetainedValue(),
+              CFGetTypeID(perf) == CFDictionaryGetTypeID(),
+              let raw = CFDictionaryGetValue(unsafeDowncast(perf, to: CFDictionary.self),
+                                             Unmanaged.passUnretained(utilKey).toOpaque())
+        else { continue }
+        let util = Unmanaged<CFTypeRef>.fromOpaque(raw).takeUnretainedValue()
+        var v = 0.0
+        if CFGetTypeID(util) == CFNumberGetTypeID(),
+           CFNumberGetValue(unsafeDowncast(util, to: CFNumber.self), .doubleType, &v) {
+            best = max(best, v / 100)
         }
     }
     return best
@@ -188,7 +212,17 @@ final class Sensors {
     }
 }
 
-// MARK: - view
+// Opened by the first temperature pass, on the temperature queue: until the menu opens,
+// the HID client and its ~77 service handles would only sit in memory.
+let sensors = Sensors()
+
+// MARK: - sampling
+
+// Nobody is looking 99.9% of the time, and a wakeup costs ~284 us whatever it does,
+// so the closed cadence is what the battery actually pays for.
+let closedTick = 10.0
+let openTick = 2.0
+let histStep = 10.0   // sparkline step, held fixed so the two cadences never mix scales
 
 struct History {
     private var v = [Float](repeating: 0, count: 60)
@@ -198,17 +232,133 @@ struct History {
     func at(_ i: Int) -> Float { v[(head + i) % v.count] }   // 0 = oldest
 }
 
-func tint(_ v: Double) -> NSColor {
-    v < 0.6 ? .systemGreen : (v < 0.85 ? .systemOrange : .systemRed)
+/// Everything a sample leaves behind. The idle ticker writes it while the menu is closed
+/// and the main thread while it is open, so it lives behind a lock and the panel keeps a
+/// copy. Only the stores happen under the lock, never the system calls.
+struct Stats {
+    var cpu = History(), gpu = History(), mem = History()
+    var pushes = 0                      // sparkline generation, so the panel knows to redraw
+    var cpuV = 0.0, gpuV = 0.0, memV = 0.0, prs = 0.0, swap = 0.0
+    var ticks = host_cpu_load_info()
+    var lastCPU = 0.0, lastHist = 0.0
+    var acc = (cpu: 0.0, gpu: 0.0, mem: 0.0, n: 0.0)
 }
 
+let latest = OSAllocatedUnfairLock(uncheckedState: Stats())
+
+/// Takes one sample; `full` adds swap, which only the open panel shows.
+@discardableResult
+func sample(full: Bool) -> Stats {
+    let now = uptime()
+    let t = hostCPU(), g = gpuUsage(), m = memStat()
+    let swap = full ? swapUsed() : -1
+    return latest.withLockUnchecked { s in
+        // the CPU figure is a delta of tick counters: sampled too close together it is
+        // noise, which is exactly what an immediate tick on menu-open would produce
+        if now - s.lastCPU > 0.4 {
+            s.cpuV = cpuLoad(s.ticks, t)
+            s.ticks = t
+            s.lastCPU = now
+        }
+        s.gpuV = g
+        s.memV = m.used / totalMem
+        s.prs = m.pressure
+        if swap >= 0 { s.swap = swap }
+        // History advances on wall-clock, not on ticks, so opening the menu does not
+        // stretch the right-hand side of the sparkline into a different time scale.
+        s.acc.cpu += s.cpuV; s.acc.gpu += s.gpuV; s.acc.mem += s.memV; s.acc.n += 1
+        if now - s.lastHist >= histStep - 0.5 {
+            s.cpu.push(s.acc.cpu / s.acc.n)
+            s.gpu.push(s.acc.gpu / s.acc.n)
+            s.mem.push(s.acc.mem / s.acc.n)
+            s.acc = (0, 0, 0, 0)
+            s.lastHist = now
+            s.pushes += 1
+        }
+        return s
+    }
+}
+
+/// Keeps the sparklines fed while the menu is closed, which is all carnival does 99.9% of
+/// the time. The tick has a thread of its own, asleep in kevent on a kqueue timer, so it is
+/// one wakeup of one thread: a main run-loop timer also ran every observer AppKit keeps on
+/// that run loop (~4 context switches a tick instead of ~1.3), and a dispatch timer wakes
+/// libdispatch's manager thread before the worker (twice the timer wakeups). Background QoS
+/// keeps the thread on Apple silicon's efficiency cores.
+final class IdleTicker {
+    private let kq = kqueue()
+
+    init() {
+        let q = kq
+        let t = Thread {
+            var ev = kevent64_s()
+            while true {
+                let n = kevent64(q, nil, 0, &ev, 1, 0, nil)
+                if n > 0 { autoreleasepool { _ = sample(full: false) } }
+                else if n < 0 && errno != EINTR { return }   // no kqueue: better no idle ticks than a spin
+            }
+        }
+        t.name = "carnival.idle"
+        t.qualityOfService = .background
+        t.start()
+    }
+
+    /// Arms or disarms a repeating closedTick timer with the same 25% leeway the main
+    /// run-loop timer had as tolerance.
+    func run(_ on: Bool) {
+        let ns = UInt64(closedTick * 1e9)
+        var ev = kevent64_s(ident: 1, filter: Int16(EVFILT_TIMER), flags: UInt16(on ? EV_ADD : EV_DELETE),
+                            fflags: UInt32(NOTE_NSECONDS | NOTE_LEEWAY), data: Int64(ns), udata: 0,
+                            ext: (0, ns / 4))
+        _ = kevent64(kq, &ev, 1, nil, 0, 0, nil)
+    }
+}
+
+// MARK: - view
+
 final class Panel: NSView {
-    var cpu = History(), gpu = History(), mem = History()
-    var cpuV = 0.0, gpuV = 0.0, memV = 0.0
-    var cpuT = Double.nan, gpuT = Double.nan
-    var prs = 0.0, swap = 0.0
+    var stats = Stats()                 // a copy of the last sample
+    var temps = (Double.nan, Double.nan)
 
     override var isFlipped: Bool { true }
+
+    /// Everything the panel prints, in the form it prints it. A tick whose readout is the
+    /// one already on screen skips the redraw, and with it the window-surface flush that
+    /// is 83% of a redraw.
+    struct Readout: Equatable {
+        var cpu, gpu, mem, cpuT, gpuT, meta: String
+        var cpuTint, gpuTint, memTint, pushes: Int
+
+        init(_ s: Stats, _ t: (Double, Double)) {
+            func pct(_ v: Double) -> String { String(format: "%.0f%%", v * 100) }
+            func deg(_ v: Double) -> String { v.isNaN ? "" : String(format: "%.0f°C", v) }
+            func level(_ v: Double) -> Int { v < 0.6 ? 0 : (v < 0.85 ? 1 : 2) }
+            cpu = pct(s.cpuV); gpu = pct(s.gpuV); mem = pct(s.memV)
+            cpuT = deg(t.0); gpuT = deg(t.1)
+            let swap = s.swap > 0 ? String(format: "%.1f GB", s.swap / 1_073_741_824) : "0"
+            meta = String(format: "%.1f GB · PRS %d%% · SWAP %@", s.memV * totalMem / 1_073_741_824,
+                          Int(s.prs * 100), swap as NSString)
+            cpuTint = level(s.cpuV); gpuTint = level(s.gpuV); memTint = level(s.prs)
+            pushes = s.pushes
+        }
+    }
+    private var shown: Readout?
+
+    /// Call after `stats` or `temps` change: queues a redraw only when a string, a tint or
+    /// a sparkline would come out different.
+    func refresh() {
+        let r = Readout(stats, temps)
+        if r != shown { shown = r; needsDisplay = true }
+    }
+
+    /// The menu closed: let the laid-out text go (the next open rebuilds it in ~70 us) and
+    /// draw in full next time.
+    func closed() {
+        lines.removeAll()
+        shown = nil
+    }
+
+    private static let tints: [NSColor] = [.systemGreen, .systemOrange, .systemRed]
 
     private static let head: [NSAttributedString.Key: Any] = [
         .font: NSFont.systemFont(ofSize: 9.5, weight: .semibold),
@@ -283,27 +433,24 @@ final class Panel: NSView {
         NSRect(x: 14, y: y, width: w - 28, height: 1).fill()
     }
 
-    private func row(_ name: String, _ v: Double, _ h: History, _ y: CGFloat, _ w: CGFloat,
-                     temp: Double = .nan, meta: String? = nil, heat: Double? = nil) -> CGFloat {
+    private func row(_ name: String, _ value: String, _ side: String, _ sideStyle: Int,
+                     _ h: History, _ tint: Int, _ y: CGFloat, _ w: CGFloat) -> CGFloat {
         text(name, 14, y, 0)
-        if !temp.isNaN { textRight(String(format: "%.0f°C", temp), w - 14, y - 3, 2) }
-        if let meta { textRight(meta, w - 14, y - 3, 1) }
-        text(String(format: "%.0f%%", v * 100), 13, y + 13, 3)
-        graph(h, NSRect(x: 76, y: y + 14, width: w - 90, height: 27), tint(heat ?? v))
+        if !side.isEmpty { textRight(side, w - 14, y - 3, sideStyle) }
+        text(value, 13, y + 13, 3)
+        graph(h, NSRect(x: 76, y: y + 14, width: w - 90, height: 27), Panel.tints[tint])
         return y + 55
     }
 
     override func draw(_ dirty: NSRect) {
+        let r = shown ?? Readout(stats, temps)
         let w = bounds.width
         var y: CGFloat = 13
-        y = row("CPU", cpuV, cpu, y, w, temp: cpuT)
+        y = row("CPU", r.cpu, r.cpuT, 2, stats.cpu, r.cpuTint, y, w)
         rule(y - 7, w)
-        y = row("GPU", gpuV, gpu, y, w, temp: gpuT)
+        y = row("GPU", r.gpu, r.gpuT, 2, stats.gpu, r.gpuTint, y, w)
         rule(y - 7, w)
-        let swapTxt = swap > 0 ? String(format: "%.1f GB", swap / 1_073_741_824) : "0"
-        let memTxt = String(format: "%.1f GB · PRS %d%% · SWAP %@", memV * totalMem / 1_073_741_824,
-                            Int(prs * 100), swapTxt as NSString)
-        _ = row("MEM", memV, mem, y, w, meta: memTxt, heat: prs)
+        _ = row("MEM", r.mem, r.meta, 1, stats.mem, r.memTint, y, w)
     }
 }
 
@@ -317,23 +464,16 @@ final class Carnival: NSObject, NSApplicationDelegate, NSMenuDelegate {
     let panel = Panel(frame: NSRect(x: 0, y: 0, width: 290, height: 180))
     let menu = NSMenu()
     let login = NSMenuItem(title: "Launch at Login", action: #selector(toggleLogin), keyEquivalent: "")
+    let idle = IdleTicker()
 
-    // Nobody is looking 99.9% of the time, and a wakeup costs ~284 us whatever it does,
-    // so the closed cadence is what the battery actually pays for.
-    static let closedTick = 10.0
-    static let openTick = 2.0
-    static let histStep = 10.0   // sparkline step, held fixed so the two cadences never mix scales
-
-    var timer: Timer?
+    var timer: Timer?                   // the open-menu tick; the idle ticker covers the rest
     var open = false
-    var lastCPU = 0.0, lastHist = 0.0, lastTemp = 0.0
-    var acc = (cpu: 0.0, gpu: 0.0, mem: 0.0, n: 0.0)
 
     // A temperature pass blocks its thread for ~17 ms while the PMU answers, but burns
     // under 1 ms of CPU doing it. Off the main thread that wait costs the UI nothing.
     let tempQ = DispatchQueue(label: "carnival.temps", qos: .utility)
-    var sensors: Sensors?        // created on tempQ and only ever touched there
     var tempBusy = false
+    var lastTemp = 0.0
 
     static func main() {
         if CommandLine.arguments.contains("--sensors") {
@@ -383,16 +523,16 @@ final class Carnival: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.delegate = self
         item.menu = menu       // NSMenu handles open/close/highlight natively - no activation dance
 
-        tempQ.async { self.sensors = Sensors() }   // ~77 HID services; warm it before the first menu
-        cadence(Carnival.closedTick)
-        tick()
+        sample(full: false)    // the first sparkline point
+        idle.run(true)
     }
 
     func menuWillOpen(_ m: NSMenu) {
         open = true
         login.state = SMAppService.mainApp.status == .enabled ? .on : .off   // may have changed in System Settings
-        cadence(Carnival.openTick)
-        tick()
+        idle.run(false)
+        cadence(openTick)
+        tick(opening: true)
     }
 
     @objc func toggleLogin() {
@@ -402,9 +542,13 @@ final class Carnival: NSObject, NSApplicationDelegate, NSMenuDelegate {
         } catch { NSSound.beep() }
         login.state = SMAppService.mainApp.status == .enabled ? .on : .off
     }
+
     func menuDidClose(_ m: NSMenu) {
         open = false
-        cadence(Carnival.closedTick)
+        timer?.invalidate()
+        timer = nil
+        idle.run(true)
+        panel.closed()
     }
 
     private func cadence(_ interval: TimeInterval) {
@@ -415,48 +559,26 @@ final class Carnival: NSObject, NSApplicationDelegate, NSMenuDelegate {
         timer = t
     }
 
-    func tick() {
-        let now = ProcessInfo.processInfo.systemUptime
-        // cpuUsage is a delta of tick counters: sampled too close together it is noise,
-        // which is exactly what an immediate tick on menu-open would otherwise produce
-        if now - lastCPU > 0.4 {
-            panel.cpuV = cpuUsage()
-            lastCPU = now
-        }
-        panel.gpuV = gpuUsage()
-        let m = memStat()
-        panel.memV = m.used / totalMem
-        panel.prs = m.pressure; panel.swap = m.swap
-
-        // History advances on wall-clock, not on ticks, so opening the menu does not
-        // stretch the right-hand side of the sparkline into a different time scale.
-        acc.cpu += panel.cpuV; acc.gpu += panel.gpuV; acc.mem += panel.memV; acc.n += 1
-        if now - lastHist >= Carnival.histStep - 0.5 {
-            panel.cpu.push(acc.cpu / acc.n)
-            panel.gpu.push(acc.gpu / acc.n)
-            panel.mem.push(acc.mem / acc.n)
-            acc = (0, 0, 0, 0)
-            lastHist = now
-        }
-
-        guard open else { return }              // temps + redraw only while the menu is up
-        if !tempBusy && now - lastTemp > 3.5 {
+    /// The open-menu tick: sample, read temperatures every ~4 s, redraw if anything
+    /// visible changed.
+    func tick(opening: Bool = false) {
+        panel.stats = sample(full: true)
+        if !tempBusy && uptime() - lastTemp > 3.5 {
             tempBusy = true
             tempQ.async { [weak self] in
-                let t = self?.sensors?.temps() ?? (.nan, .nan)
+                let t = sensors?.temps() ?? (.nan, .nan)
                 DispatchQueue.main.async {
                     guard let self else { return }
                     self.tempBusy = false
-                    self.lastTemp = ProcessInfo.processInfo.systemUptime
-                    // the panel prints whole degrees, so a fractional change is not worth
-                    // a second 4.5 ms redraw on top of the one this tick already queued
-                    func deg(_ x: Double) -> Int { x.isFinite ? Int(x.rounded()) : .min }
-                    let changed = deg(t.0) != deg(self.panel.cpuT) || deg(t.1) != deg(self.panel.gpuT)
-                    self.panel.cpuT = t.0; self.panel.gpuT = t.1
-                    if self.open && changed { self.panel.needsDisplay = true }
+                    self.lastTemp = uptime()
+                    self.panel.temps = t
+                    if self.open { self.panel.refresh() }
                 }
             }
+            // The pass lands within ~17 ms: this tick's numbers wait for it and go out in
+            // one redraw instead of two. A menu that is just opening cannot wait.
+            if !opening { return }
         }
-        panel.needsDisplay = true
+        panel.refresh()
     }
 }
