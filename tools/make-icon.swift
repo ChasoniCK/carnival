@@ -1,5 +1,6 @@
-// Draws carnival.icns: a ferris wheel, the most legible piece of carnival
-// iconography that still reads as a dial at 16pt. Run: ./tools/make-icon.sh
+// Draws carnival.icns: the panel's sparkline taking a roller-coaster ride - a lift
+// hill, a loop, and the dot of "now" at the end. carnival.swift draws the same track
+// as the menu-bar glyph. Run: ./tools/make-icon.sh
 import AppKit
 
 let C: CGFloat = 1024                  // canvas; macOS art sits in an 824pt squircle
@@ -11,7 +12,8 @@ func squircle() -> NSBezierPath {
                  xRadius: corner, yRadius: corner)
 }
 
-func draw() -> NSImage {
+// `bold` is the cut for 16 and 32 px, where the regular stroke thins out below a pixel
+func draw(bold: Bool) -> NSImage {
     let img = NSImage(size: NSSize(width: C, height: C))
     img.lockFocus()
     let ctx = NSGraphicsContext.current!.cgContext
@@ -25,69 +27,48 @@ func draw() -> NSImage {
     body.lineWidth = 3
     body.stroke()
 
-    let cx: CGFloat = 512, cy: CGFloat = 585, R: CGFloat = 252
     let green = NSColor(srgbRed: 0.24, green: 0.82, blue: 0.35, alpha: 1)
-    let steel = NSColor(srgbRed: 0.60, green: 0.62, blue: 0.65, alpha: 1)
 
-    // legs, clipped out of the wheel's interior so they do not clutter the spokes
-    ctx.saveGState()
-    let mask = squircle()
-    mask.append(NSBezierPath(ovalIn: NSRect(x: cx - R + 12, y: cy - R + 12, width: (R - 12) * 2, height: (R - 12) * 2)))
-    mask.windingRule = .evenOdd
-    mask.setClip()
-    steel.setStroke()
-    let legs = NSBezierPath()
-    legs.lineWidth = 34
-    legs.lineCapStyle = .round
-    legs.move(to: NSPoint(x: cx - 158, y: 150)); legs.line(to: NSPoint(x: cx, y: cy))
-    legs.move(to: NSPoint(x: cx + 158, y: 150)); legs.line(to: NSPoint(x: cx, y: cy))
-    legs.stroke()
-    ctx.restoreGState()
-    steel.setFill()
-    NSBezierPath(roundedRect: NSRect(x: cx - 214, y: 122, width: 428, height: 38),
-                 xRadius: 19, yRadius: 19).fill()
-
-    // gondolas, hung outside the rim
-    let cabin: CGFloat = 8
-    for i in 0..<Int(cabin) {
-        let a = CGFloat(i) / cabin * .pi * 2 - .pi / 2   // seat 0 sits at the bottom
-        let p = NSPoint(x: cx + cos(a) * (R + 42), y: cy + sin(a) * (R + 42))
-        green.withAlphaComponent(0.92).setFill()
-        NSBezierPath(roundedRect: NSRect(x: p.x - 36, y: p.y - 29, width: 72, height: 58),
-                     xRadius: 22, yRadius: 22).fill()
+    // the track lives on a 256-unit grid with y down; `at` places it in the squircle
+    let s: CGFloat = bold ? 2.85 : 2.6
+    func at(_ x: CGFloat, _ y: CGFloat) -> NSPoint { NSPoint(x: 512 + (x - 126) * s, y: 548 - (y - 133.5) * s) }
+    // Both ramps meet the loop at 45 degrees and cross at (154, 172.4). An arc that
+    // starts away from the current point draws the straight ramp up to it for free.
+    func track(loop: Bool) -> NSBezierPath {
+        let p = NSBezierPath()
+        p.move(to: at(12, 190)); p.line(to: at(24, 190))
+        p.curve(to: at(70, 70), controlPoint1: at(44, 190), controlPoint2: at(50, 70))        // lift hill
+        p.curve(to: at(114.5, 197), controlPoint1: at(94, 70), controlPoint2: at(88, 197))
+        p.appendArc(withCenter: at(114.5, 161), radius: 36 * s, startAngle: 270, endAngle: 315)
+        if loop { p.appendArc(withCenter: at(154, 130), radius: 30 * s, startAngle: -45, endAngle: 225) }
+        else { p.line(to: at(154, 172.4)) }
+        p.appendArc(withCenter: at(193.5, 161), radius: 36 * s, startAngle: 225, endAngle: 270)
+        p.curve(to: at(234, 140), controlPoint1: at(209.5, 197), controlPoint2: at(220, 154))
+        return p
     }
 
-    // spokes
-    green.setStroke()
-    let spokes = NSBezierPath()
-    spokes.lineWidth = 16
-    spokes.lineCapStyle = .round
-    for i in 0..<Int(cabin) {
-        let a = CGFloat(i) / cabin * .pi * 2 - .pi / 2   // seat 0 sits at the bottom
-        spokes.move(to: NSPoint(x: cx, y: cy))
-        spokes.line(to: NSPoint(x: cx + cos(a) * R, y: cy + sin(a) * R))
-    }
-    spokes.stroke()
+    // the fill under the line, fading out the way the panel's sparklines do
+    let area = track(loop: false)
+    area.line(to: at(234, 262)); area.line(to: at(12, 262))
+    area.close()
+    NSGradient(colors: [green.withAlphaComponent(0.38), green.withAlphaComponent(0.01)])?.draw(in: area, angle: -90)
 
-    // rim
-    let rim = NSBezierPath(ovalIn: NSRect(x: cx - R, y: cy - R, width: R * 2, height: R * 2))
-    rim.lineWidth = 34
     green.setStroke()
-    rim.stroke()
+    let line = track(loop: true)
+    line.lineWidth = (bold ? 24 : 16) * s
+    line.lineCapStyle = .round
+    line.lineJoinStyle = .round
+    line.stroke()
 
-    // hub
-    NSColor(srgbRed: 0.11, green: 0.12, blue: 0.13, alpha: 1).setFill()
-    NSBezierPath(ovalIn: NSRect(x: cx - 52, y: cy - 52, width: 104, height: 104)).fill()
-    green.setStroke()
-    let hub = NSBezierPath(ovalIn: NSRect(x: cx - 52, y: cy - 52, width: 104, height: 104))
-    hub.lineWidth = 22
-    hub.stroke()
+    green.setFill()
+    let dot = (bold ? 19 : 14) * s, end = at(234, 140)
+    NSBezierPath(ovalIn: NSRect(x: end.x - dot, y: end.y - dot, width: dot * 2, height: dot * 2)).fill()
 
     img.unlockFocus()
     return img
 }
 
-let master = draw()
+let master = draw(bold: false), small = draw(bold: true)
 let dir = CommandLine.arguments.count > 1 ? CommandLine.arguments[1] : "."
 for px in [16, 32, 64, 128, 256, 512, 1024] {
     let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: px, pixelsHigh: px,
@@ -96,7 +77,7 @@ for px in [16, 32, 64, 128, 256, 512, 1024] {
     NSGraphicsContext.saveGraphicsState()
     NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: rep)
     NSGraphicsContext.current?.imageInterpolation = .high
-    master.draw(in: NSRect(x: 0, y: 0, width: px, height: px))
+    (px <= 32 ? small : master).draw(in: NSRect(x: 0, y: 0, width: px, height: px))
     NSGraphicsContext.restoreGraphicsState()
     try! rep.representation(using: .png, properties: [:])!
         .write(to: URL(fileURLWithPath: "\(dir)/icon_\(px).png"))

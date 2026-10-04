@@ -454,6 +454,34 @@ final class Panel: NSView {
     }
 }
 
+/// The menu-bar glyph: the app icon's track (tools/make-icon.swift) - lift hill, loop,
+/// the dot of "now" - as a template image, so the bar tints it for every appearance.
+func glyph() -> NSImage {
+    let img = NSImage(size: NSSize(width: 24, height: 15), flipped: false) { _ in
+        let s: CGFloat = 0.094   // the icon's 256-unit grid, y down, at a 1.5 pt stroke
+        func at(_ x: CGFloat, _ y: CGFloat) -> NSPoint { NSPoint(x: 12 + (x - 126) * s, y: 7.5 - (y - 133.5) * s) }
+        NSColor.black.set()
+        let p = NSBezierPath()
+        p.move(to: at(12, 190)); p.line(to: at(24, 190))
+        p.curve(to: at(70, 70), controlPoint1: at(44, 190), controlPoint2: at(50, 70))
+        p.curve(to: at(114.5, 197), controlPoint1: at(94, 70), controlPoint2: at(88, 197))
+        p.appendArc(withCenter: at(114.5, 161), radius: 36 * s, startAngle: 270, endAngle: 315)
+        p.appendArc(withCenter: at(154, 130), radius: 30 * s, startAngle: -45, endAngle: 225)
+        p.appendArc(withCenter: at(193.5, 161), radius: 36 * s, startAngle: 225, endAngle: 270)
+        p.curve(to: at(234, 140), controlPoint1: at(209.5, 197), controlPoint2: at(220, 154))
+        p.lineWidth = 16 * s
+        p.lineCapStyle = .round
+        p.lineJoinStyle = .round
+        p.stroke()
+        let end = at(234, 140)
+        NSBezierPath(ovalIn: NSRect(x: end.x - 1.5, y: end.y - 1.5, width: 3, height: 3)).fill()
+        return true
+    }
+    img.isTemplate = true
+    img.accessibilityDescription = "carnival"
+    return img
+}
+
 // MARK: - app
 
 @main
@@ -508,7 +536,7 @@ final class Carnival: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // Without a stable autosave name the system re-picks a slot on every launch, so
         // a reinstall drops the icon back into the overflow area behind the chevron.
         item.autosaveName = "carnival"
-        item.button?.image = NSImage(systemSymbolName: "gauge.with.dots.needle.33percent", accessibilityDescription: "carnival")
+        item.button?.image = glyph()
 
         let mi = NSMenuItem()
         mi.view = panel

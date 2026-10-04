@@ -11,7 +11,7 @@ A macOS menu-bar monitor that shows CPU, GPU and memory — and nothing else.
 - **MEM** — used percentage, sparkline, used GB, memory pressure, swap
 - `Launch at Login` toggle, `Quit`
 
-Written in ~580 lines of Swift against AppKit and IOKit. No dependencies, no
+Written in ~610 lines of Swift against AppKit and IOKit. No dependencies, no
 settings window, no background daemon. With the menu closed it wakes one background
 thread every 10 s for three system calls, and leaves the main thread asleep: idle CPU
 is 20-40% below the previous build's, measured side by side
@@ -111,7 +111,9 @@ window surface flush. Pre-rendering the gauge symbol into a bitmap saves 7-19% o
 CPU and 0.2 MB — the status bar seems to re-render a symbol every time it redraws the
 item — but the bitmap comes out a shade lighter and a pixel narrower than the symbol
 the status bar draws; `NSImage.cacheMode = .always` on the symbol changes nothing. The
-two SF Symbols cost ~0.5 MB for the life of the process. The 130-150 MB spike on first
+two SF Symbols cost ~0.5 MB for the life of the process. (All of that was measured on
+the SF Symbol gauge the menu bar showed then; the item is now a path drawn in code,
+which has not been re-measured.) The 130-150 MB spike on first
 menu render is an in-process GPU renderer that AppKit raises for text and gradient
 drawing — it is not reachable from here and settles back to ~23 MB.
 
