@@ -322,9 +322,23 @@ final class Panel: NSView {
 
     override var isFlipped: Bool { true }
 
+    // The layer AppKit backs a view with hands CoreAnimation a display list, and
+    // CoreAnimation renders that with Metal inside this process: 130-150 MB at the menu's
+    // first redraw, 5 MB of it for good. A plain CALayer keeps a bitmap that draw(_:)
+    // fills on the CPU - but nothing sets its scale or marks it for redraw except the
+    // overrides below and refresh().
+    override func makeBackingLayer() -> CALayer { CALayer() }
+
+    override func viewDidMoveToWindow() {
+        guard let w = window else { layer?.contents = nil; return }   // off screen: let the bitmap go
+        layer?.contentsScale = w.backingScaleFactor
+        layer?.setNeedsDisplay()
+    }
+
+    override func viewDidChangeEffectiveAppearance() { layer?.setNeedsDisplay() }
+
     /// Everything the panel prints, in the form it prints it. A tick whose readout is the
-    /// one already on screen skips the redraw, and with it the window-surface flush that
-    /// is 83% of a redraw.
+    /// one already on screen skips the redraw.
     struct Readout: Equatable {
         var cpu, gpu, mem, cpuT, gpuT, meta: String
         var cpuTint, gpuTint, memTint, pushes: Int
@@ -348,7 +362,7 @@ final class Panel: NSView {
     /// a sparkline would come out different.
     func refresh() {
         let r = Readout(stats, temps)
-        if r != shown { shown = r; needsDisplay = true }
+        if r != shown { shown = r; layer?.setNeedsDisplay() }
     }
 
     /// The menu closed: let the laid-out text go (the next open rebuilds it in ~70 us) and
@@ -539,13 +553,11 @@ final class Carnival: NSObject, NSApplicationDelegate, NSMenuDelegate {
         item.button?.image = glyph()
 
         let mi = NSMenuItem()
+        panel.wantsLayer = true   // the layer has to be there for the first refresh()
         mi.view = panel
         menu.addItem(mi)
         menu.addItem(.separator())
         login.target = self
-        // Quit gets a system-drawn glyph; without one of its own this item's title
-        // sits in the icon column and jumps left whenever the checkmark is off
-        login.image = NSImage(systemSymbolName: "power", accessibilityDescription: nil)
         menu.addItem(login)
         menu.addItem(NSMenuItem(title: "Quit carnival", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
         menu.delegate = self

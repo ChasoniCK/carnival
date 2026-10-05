@@ -11,7 +11,7 @@ A macOS menu-bar monitor that shows CPU, GPU and memory — and nothing else.
 - **MEM** — used percentage, sparkline, used GB, memory pressure, swap
 - `Launch at Login` toggle, `Quit`
 
-Written in ~610 lines of Swift against AppKit and IOKit. No dependencies, no
+Written in ~620 lines of Swift against AppKit and IOKit. No dependencies, no
 settings window, no background daemon. With the menu closed it wakes one background
 thread every 10 s for three system calls, and leaves the main thread asleep: idle CPU
 is 20-40% below the previous build's, measured side by side
@@ -28,7 +28,7 @@ open carnival.app
 `./tools/make-icon.sh` regenerates `carnival.icns`; the artwork is drawn in code,
 there is no binary source asset to edit.
 
-Requires the Xcode command line tools and macOS 26 or newer. The build ad-hoc
+Requires the Xcode command line tools and macOS 27 or newer. The build ad-hoc
 signs the bundle, so a copy downloaded from Releases needs its quarantine flag
 cleared once:
 
@@ -105,17 +105,41 @@ open (three 40 s runs each) the panel redraws 26 times a minute instead of 31, a
 went from 0.23% to 0.18% of one core, inside the runs' spread.
 
 Measured and rejected: `Timer.tolerance` and `DispatchSourceTimer` leeway change
-nothing (0.0172% vs 0.0177%); a pre-rendered gradient image is a 37% *regression* in a
-real menu window; per-row invalidation saves nothing because 83% of a redraw is the
-window surface flush. Pre-rendering the gauge symbol into a bitmap saves 7-19% of idle
-CPU and 0.2 MB — the status bar seems to re-render a symbol every time it redraws the
-item — but the bitmap comes out a shade lighter and a pixel narrower than the symbol
-the status bar draws; `NSImage.cacheMode = .always` on the symbol changes nothing. The
-two SF Symbols cost ~0.5 MB for the life of the process. (All of that was measured on
-the SF Symbol gauge the menu bar showed then; the item is now a path drawn in code,
-which has not been re-measured.) The 130-150 MB spike on first
-menu render is an in-process GPU renderer that AppKit raises for text and gradient
-drawing — it is not reachable from here and settles back to ~23 MB.
+nothing (0.0172% vs 0.0177%). Two more were rejected on the layer AppKit backed the
+panel with and have not been tried again on the plain one below: a pre-rendered
+gradient image was a 37% *regression* in a real menu window, and per-row invalidation
+saved nothing because 83% of a redraw was the window surface flush — on the plain
+layer `draw(_:)` is about a third of the open menu's CPU. Pre-rendering the gauge
+symbol the menu bar used to show into a bitmap saved 7-19% of idle CPU and 0.2 MB —
+the status bar seemed to re-render a symbol every time it redrew the item — but the
+bitmap came out a shade lighter and a pixel narrower than the symbol the status bar
+draws; `NSImage.cacheMode = .always` on the symbol changed nothing.
+
+The item is now a path drawn in code, and pre-rendering that is rejected for the
+opposite reason: bitmaps at 1x and 2x are byte-identical to the drawn glyph in every
+appearance, and there is nothing left for them to save. The idle phase of
+`tools/bench/run.sh` with three builds instead of two, 10 minutes on an M4 Pro under
+macOS 27: an hour with the menu closed costs 87 ms of CPU with the symbol, 88 ms with
+the drawn glyph and 87 ms with the pre-rendered one while the icon is on screen, and
+85, 90 and 88 ms while it sits in the overflow behind the chevron — copies of one build
+are up to 7 ms apart, and AppKit alone takes 1 ms. macOS 27 hosts the item in
+MenuBarAgent and did not redraw it once in those 10 minutes; the drawing handler runs
+once, ~400 us when the icon first comes on screen and never while it stays in the
+overflow, and AppKit keeps the raster for later redraws. Pre-rendering moves that run
+to launch and holds 0.3 MB more, 12.7 MB against 12.4 MB on screen. The symbol was the
+heaviest of the three at 13.0 MB. The last SF Symbol, `power` on Launch at Login, is
+gone too: macOS 27 does not show a menu item's image, the menu lays out the same
+without it, checkmark on or off, and it cost up to 0.1 MB from launch.
+
+The panel draws into a plain `CALayer`, not the layer AppKit would back the view with.
+That one hands CoreAnimation a display list, which CoreAnimation renders with Metal
+inside the process: 131-151 MB at the menu's first redraw and 23 MB left once it has
+closed. The plain layer is a bitmap that `draw(_:)` fills on the CPU: 22 MB with the
+menu open and 18 MB after, against ~17 MB for a menu with no panel in it. Three 40 s
+runs each on the M4 Pro: the open menu goes from 0.55% to 0.18% of one core and from
+68 to 14 mJ a minute at the same 32 redraws a minute, and idle stays where it was, 85
+ms of CPU an hour either way. On screen the two differ by at most 3 levels out of 255,
+in 399 of the panel's 208 800 pixels.
 
 ## Notes
 
